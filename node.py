@@ -36,6 +36,44 @@ class OpenRouterNode:
         "qwen/qwen-image-3",
         "qwen/qwen-image-3-pro",
     ]
+    image_generation_models = frozenset(pinned_models)
+    resolution_tiers = ("1K", "2K", "4K")
+    image_capabilities_cache = None
+    image_capabilities_last_fetch_time = 0
+    # Fallback used when /api/v1/images/models is unavailable.
+    # Values match OpenRouter's supported_parameters for these models.
+    fallback_image_model_capabilities = {
+        "bytedance-seed/seedream-5-0-lite": {
+            "resolution": {"values": ["2K", "4K"]},
+            "aspect_ratio": {"values": ["1:1", "1:2", "2:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "9:19.5", "19.5:9", "9:20", "20:9", "9:21", "21:9", "auto"]},
+            "input_references": {"max": 14},
+            "seed": True,
+        },
+        "bytedance-seed/seedream-5-0-pro": {
+            "resolution": {"values": ["1K", "2K"]},
+            "aspect_ratio": {"values": ["1:1", "1:2", "2:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "9:19.5", "19.5:9", "9:20", "20:9", "9:21", "21:9", "auto"]},
+            "input_references": {"max": 14},
+            "seed": True,
+        },
+        "x-ai/grok-imagine-image-2.0": {
+            "resolution": {"values": ["1K", "2K"]},
+            "aspect_ratio": {"values": ["1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "9:19.5", "19.5:9", "9:20", "20:9", "1:2", "2:1", "auto"]},
+            "input_references": {"max": 3},
+            "seed": False,
+        },
+        "qwen/qwen-image-3": {
+            "resolution": {"values": ["1K", "2K"]},
+            "aspect_ratio": {"values": ["1:1", "1:2", "1:4", "2:1", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "9:16", "16:9"]},
+            "input_references": {"max": 4},
+            "seed": True,
+        },
+        "qwen/qwen-image-3-pro": {
+            "resolution": {"values": ["1K", "2K"]},
+            "aspect_ratio": {"values": ["1:1", "1:2", "1:4", "2:1", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "9:16", "16:9"]},
+            "input_references": {"max": 4},
+            "seed": True,
+        },
+    }
     default_request_timeout = 120
     min_request_timeout = 1
     max_request_timeout = 3600
@@ -175,10 +213,197 @@ class OpenRouterNode:
         return cls.models_cache if cls.models_cache else list(cls.pinned_models) # Ensure it's never empty
 
     @classmethod
+    def fetch_image_model_capabilities(cls):
+        """
+        Fetches per-model Image API capabilities, with a local fallback table.
+        """
+        current_time = time.time()
+        if (cls.image_capabilities_cache is None) or (current_time - cls.image_capabilities_last_fetch_time > cls.cache_duration):
+            url = "https://openrouter.ai/api/v1/images/models"
+            try:
+                response = requests.get(url, timeout=cls.default_request_timeout)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("unexpected image models payload")
+                models = payload.get("data")
+                if not isinstance(models, list):
+                    raise ValueError("unexpected image models data")
+                live_caps = {}
+                for model in models:
+                    model_id = model.get("id")
+                    params = model.get("supported_parameters")
+                    if model_id and isinstance(params, dict):
+                        live_caps[model_id] = params
+                if live_caps:
+                    cls.image_capabilities_cache = live_caps
+                    cls.image_capabilities_last_fetch_time = current_time
+            except Exception as e:
+                print(f"Error fetching image model capabilities: {e}")
+                if cls.image_capabilities_cache is None:
+                    cls.image_capabilities_cache = dict(cls.fallback_image_model_capabilities)
+                    cls.image_capabilities_last_fetch_time = current_time
+        return cls.image_capabilities_cache or dict(cls.fallback_image_model_capabilities)
+
+    @classmethod
+    def get_image_model_capabilities(cls, model):
+        base_model = (model or "").split(":")[0]
+        live_caps = cls.fetch_image_model_capabilities().get(base_model)
+        if live_caps:
+            return live_caps
+        return cls.fallback_image_model_capabilities.get(base_model, {})
+
+    @classmethod
     def _with_pinned_models(cls, model_list):
         """Prepend pinned models to the dropdown, without duplicating API results."""
         remaining = [model_id for model_id in model_list if model_id not in cls.pinned_models]
         return list(cls.pinned_models) + remaining
+
+    @classmethod
+    def is_image_generation_model(cls, model):
+        """Dedicated image models use /api/v1/images instead of chat completions."""
+        if not model:
+            return False
+        base_model = model.split(":")[0]
+        return base_model in cls.image_generation_models
+
+    @staticmethod
+    def normalize_aspect_ratio(aspect_ratio):
+        """Convert UI labels like '16:9 (1344x768)' to API values like '16:9'."""
+        if not aspect_ratio:
+            return "auto"
+        return str(aspect_ratio).split()[0]
+
+    @staticmethod
+    def _enum_values(spec):
+        if isinstance(spec, dict):
+            return list(spec.get("values") or [])
+        if isinstance(spec, (list, tuple)):
+            return list(spec)
+        return []
+
+    @staticmethod
+    def _range_max(spec, default=0):
+        if isinstance(spec, dict) and spec.get("max") is not None:
+            try:
+                return int(spec["max"])
+            except (TypeError, ValueError):
+                return default
+        if isinstance(spec, int):
+            return spec
+        return default
+
+    @staticmethod
+    def _supports_flag(spec):
+        if spec is True:
+            return True
+        if spec is False or spec is None:
+            return False
+        if isinstance(spec, dict):
+            return True
+        return bool(spec)
+
+    @classmethod
+    def clamp_resolution(cls, requested, allowed):
+        if not allowed:
+            return None
+        if requested in allowed:
+            return requested
+        if requested in cls.resolution_tiers:
+            idx = cls.resolution_tiers.index(requested)
+            for value in cls.resolution_tiers[idx:]:
+                if value in allowed:
+                    return value
+            for value in reversed(cls.resolution_tiers[:idx]):
+                if value in allowed:
+                    return value
+        return allowed[0]
+
+    @staticmethod
+    def _aspect_ratio_value(ratio):
+        left, right = ratio.split(":", 1)
+        return float(left) / float(right)
+
+    @classmethod
+    def clamp_aspect_ratio(cls, requested, allowed):
+        if not allowed:
+            return None
+        if requested in allowed:
+            return requested
+        if requested == "auto":
+            return None
+        candidates = [ratio for ratio in allowed if ratio != "auto"]
+        if not candidates:
+            return "auto" if "auto" in allowed else None
+        try:
+            target = cls._aspect_ratio_value(requested)
+            return min(candidates, key=lambda ratio: abs(cls._aspect_ratio_value(ratio) - target))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def build_image_payload(self, model, prompt, aspect_ratio, image_resolution, seed, input_references):
+        capabilities = self.get_image_model_capabilities(model)
+        data = {
+            "model": model,
+            "prompt": prompt,
+        }
+
+        allowed_resolutions = self._enum_values(capabilities.get("resolution"))
+        clamped_resolution = self.clamp_resolution(image_resolution, allowed_resolutions)
+        if clamped_resolution:
+            data["resolution"] = clamped_resolution
+            if image_resolution and clamped_resolution != image_resolution:
+                print(f"Adjusted resolution {image_resolution} -> {clamped_resolution} for {model}")
+
+        requested_ratio = self.normalize_aspect_ratio(aspect_ratio)
+        allowed_ratios = self._enum_values(capabilities.get("aspect_ratio"))
+        clamped_ratio = self.clamp_aspect_ratio(requested_ratio, allowed_ratios)
+        if clamped_ratio:
+            data["aspect_ratio"] = clamped_ratio
+            if requested_ratio and clamped_ratio != requested_ratio:
+                print(f"Adjusted aspect_ratio {requested_ratio} -> {clamped_ratio} for {model}")
+
+        if seed and self._supports_flag(capabilities.get("seed")):
+            data["seed"] = seed
+
+        max_refs = self._range_max(capabilities.get("input_references"))
+        if input_references and max_refs > 0:
+            if len(input_references) > max_refs:
+                print(f"Truncating input_references {len(input_references)} -> {max_refs} for {model}")
+            data["input_references"] = input_references[:max_refs]
+        elif input_references:
+            print(f"Omitting input_references; {model} does not support them")
+
+        return data
+
+    @staticmethod
+    def is_dynamic_image_key(key):
+        """True for dynamic image slots like image_1, not widgets like image_resolution."""
+        if not isinstance(key, str) or not key.startswith("image_"):
+            return False
+        suffix = key.split("_", 1)[1]
+        return suffix.isdigit()
+
+    @classmethod
+    def dynamic_image_keys(cls, kwargs):
+        return sorted(
+            [key for key in kwargs.keys() if cls.is_dynamic_image_key(key)],
+            key=lambda key: int(key.split("_", 1)[1]),
+        )
+
+    @staticmethod
+    def is_usable_reference_image(image):
+        if image is None:
+            return False
+        if isinstance(image, torch.Tensor):
+            if image.ndim == 4:
+                height, width = image.shape[1], image.shape[2]
+            elif image.ndim == 3:
+                height, width = image.shape[0], image.shape[1]
+            else:
+                return True
+            return height > 1 and width > 1
+        return True
 
     def validate_temperature(self, temperature):
         """
@@ -294,6 +519,19 @@ class OpenRouterNode:
         # Decide whether to use user_message_input or user_message_box
         user_text = user_message_input if user_message_input is not None and user_message_input.strip() else user_message_box
 
+        if self.is_image_generation_model(model):
+            return self.generate_image(
+                api_key=api_key,
+                headers=headers,
+                model=model,
+                prompt=user_text,
+                aspect_ratio=aspect_ratio,
+                image_resolution=image_resolution,
+                seed=seed,
+                timeout=validated_timeout,
+                kwargs=kwargs,
+            )
+
         # Initialize session_path
         session_path = None
         
@@ -322,9 +560,8 @@ class OpenRouterNode:
         })
 
         # 2. Add Image parts (optional) - support multiple images from kwargs
-        # Process all image_N inputs from kwargs
-        image_keys = sorted([k for k in kwargs.keys() if k.startswith('image_')], 
-                           key=lambda x: int(x.split('_')[1]))
+        # Process all image_N inputs from kwargs, ignoring widgets like image_resolution
+        image_keys = self.dynamic_image_keys(kwargs)
         
         for image_key in image_keys:
             if kwargs[image_key] is not None:
@@ -574,6 +811,105 @@ class OpenRouterNode:
              print(f"ERROR: Node Error: {str(e)}")
              return (f"Node Error: {str(e)}", placeholder_image, "Stats N/A due to error", "Credits N/A due to error")
 
+    def generate_image(self, api_key, headers, model, prompt, aspect_ratio,
+                       image_resolution, seed, timeout, kwargs):
+        """
+        Sends a request to OpenRouter's dedicated image generation API.
+        """
+        placeholder_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+        url = "https://openrouter.ai/api/v1/images"
+
+        if not prompt or not str(prompt).strip():
+            return ("Error: Image generation requires a prompt.", placeholder_image, "Stats N/A", "Credits N/A")
+
+        input_references = []
+        image_keys = self.dynamic_image_keys(kwargs)
+        for image_key in image_keys:
+            image = kwargs[image_key]
+            if not self.is_usable_reference_image(image):
+                continue
+            try:
+                img_str = self.image_to_base64(image)
+                input_references.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{img_str}"
+                    }
+                })
+            except Exception as e:
+                print(f"Error processing {image_key}: {e}")
+                return (f"Error processing {image_key}: {e}", placeholder_image, "Stats N/A", "Credits N/A")
+
+        data = self.build_image_payload(
+            model=model,
+            prompt=str(prompt).strip(),
+            aspect_ratio=aspect_ratio,
+            image_resolution=image_resolution,
+            seed=seed,
+            input_references=input_references,
+        )
+
+        print(f"Image payload: model={data.get('model')}, aspect_ratio={data.get('aspect_ratio')}, resolution={data.get('resolution')}")
+
+        try:
+            start_time = time.time()
+            response = requests.post(url, headers=headers, json=data, timeout=timeout)
+            response.raise_for_status()
+            end_time = time.time()
+
+            result = response.json()
+            debug_str = json.dumps(result, default=str)
+            print(f"Image API response ({len(debug_str)} chars): {debug_str[:500]}")
+
+            images = result.get("data") or []
+            if not images:
+                raise ValueError("Invalid response format from Image API: 'data' missing or empty.")
+
+            first_image = images[0]
+            b64_json = first_image.get("b64_json", "")
+            if b64_json.startswith("data:image") and "," in b64_json:
+                b64_json = b64_json.split(",", 1)[1]
+            if not b64_json:
+                raise ValueError("Invalid response format from Image API: 'b64_json' missing.")
+
+            image_tensor = self.base64_to_image(b64_json)
+            elapsed_time = end_time - start_time
+            api_usage = result.get("usage", {})
+            prompt_tokens = api_usage.get("prompt_tokens", 0)
+            completion_tokens = api_usage.get("completion_tokens", 0)
+            cost = api_usage.get("cost")
+
+            stats_text = (
+                f"Elapsed: {elapsed_time:.2f}s, "
+                f"Prompt Tokens: {prompt_tokens}, "
+                f"Completion Tokens: {completion_tokens}, "
+                f"Aspect: {data.get('aspect_ratio', 'auto')}, "
+                f"Resolution: {data.get('resolution', image_resolution)}, "
+                f"Model: {model}"
+            )
+            if cost is not None:
+                stats_text += f", Cost: ${cost}"
+
+            credits_text = self.fetch_credits(api_key, timeout=timeout)
+            text_output = f"Image generated with {model}"
+            return (text_output, image_tensor, stats_text, credits_text)
+
+        except requests.exceptions.RequestException as e:
+            error_message = f"Image API Request Error: {str(e)}"
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    error_detail = e.response.json()
+                    error_message += f" | Details: {error_detail}"
+                except json.JSONDecodeError:
+                    error_message += f" | Status: {e.response.status_code} | Response: {e.response.text[:200]}"
+            else:
+                error_message += " (Network or connection issue)"
+            print(f"ERROR: {error_message}")
+            return (error_message, placeholder_image, "Stats N/A due to error", "Credits N/A due to error")
+        except Exception as e:
+            print(f"ERROR: Node Error: {str(e)}")
+            return (f"Node Error: {str(e)}", placeholder_image, "Stats N/A due to error", "Credits N/A due to error")
+
     @staticmethod
     def image_to_base64(image):
         """
@@ -691,8 +1027,7 @@ class OpenRouterNode:
         """
         # Hash image data if present - handle multiple images from kwargs
         image_hashes = []
-        image_keys = sorted([k for k in kwargs.keys() if k.startswith('image_')], 
-                           key=lambda x: int(x.split('_')[1]))
+        image_keys = cls.dynamic_image_keys(kwargs)
         
         for image_key in image_keys:
             if kwargs[image_key] is not None:

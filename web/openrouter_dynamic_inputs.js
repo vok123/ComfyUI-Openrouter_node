@@ -18,6 +18,13 @@ const TypeSlotEvent = {
 const NODE_ID = "OpenRouterNode";
 const PREFIX = "image";
 const TYPE = "IMAGE";
+const DYNAMIC_IMAGE_SLOT = new RegExp(`^${PREFIX}(?:_\\d*)?$`);
+
+function isDynamicImageSlot(name) {
+    // Match placeholder "image", temporary "image_", and indexed "image_1".
+    // Do not match other widgets such as "image_resolution".
+    return typeof name === "string" && DYNAMIC_IMAGE_SLOT.test(name);
+}
 
 app.registerExtension({
     name: 'OpenRouter.DynamicImageInputs',
@@ -54,8 +61,8 @@ app.registerExtension({
             const me = onConnectionsChange?.apply(this, arguments);
 
             if (slotType === TypeSlot.Input) {
-                // Only process image inputs
-                if (node_slot && !node_slot.name.startsWith(PREFIX)) {
+                // Only process dynamic image inputs, not widgets like image_resolution
+                if (node_slot && !isDynamicImageSlot(node_slot.name)) {
                     return me;
                 }
                 
@@ -83,8 +90,8 @@ app.registerExtension({
                 let toRemove = [];
                 
                 for(const slot of this.inputs) {
-                    // Skip non-image inputs
-                    if (!slot.name.startsWith(PREFIX)) {
+                    // Skip non-image inputs, including image_resolution
+                    if (!isDynamicImageSlot(slot.name)) {
                         idx += 1;
                         continue;
                     }
@@ -111,7 +118,7 @@ app.registerExtension({
                 // Check if the last input is an image input
                 let lastInput = null;
                 for (let i = this.inputs.length - 1; i >= 0; i--) {
-                    if (this.inputs[i].name.startsWith(PREFIX)) {
+                    if (isDynamicImageSlot(this.inputs[i].name)) {
                         lastInput = this.inputs[i];
                         break;
                     }
